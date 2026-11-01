@@ -81,16 +81,8 @@ jobs:
           python-version: '3.13'
 
       - name: "[03] 工具链自测（约 5 秒，防止带坏脚本去改源码）"
-        id: toolchain
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = (python -m zhkit --version).Trim()
-          if ($LASTEXITCODE -ne 0) { throw '工具链无法启动' }
-          "version=$version" >> $env:GITHUB_OUTPUT
-          Write-Output "工具链：$version"
-          python -m zhkit selftest
-          if ($LASTEXITCODE -ne 0) { throw '工具链自测未通过' }
+        run: python -m zhkit selftest
 
       - name: "[04] 检出上游源码（含全部子模块，取 XeSS / FidelityFX 预编译 DLL）"
         uses: actions/checkout@v7
@@ -313,7 +305,6 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           UPSTREAM_SHA: ${{ steps.ver.outputs.upstream_sha }}
-          TOOLCHAIN: ${{ steps.toolchain.outputs.version }}
         run: |
           $coverage = ''
           if (Test-Path 'coverage.txt') {
@@ -331,7 +322,6 @@ jobs:
           $md = @(
             ('- 上游源码：`optiscaler/OptiScaler@' + $shortSha + '`'),
             ('- 版本：`' + $env:VERSION + '` / 构建日期：`' + (Get-Date -Format 'yyyy-MM-dd') + '`'),
-            ('- 汉化工具链：`' + $env:TOOLCHAIN + '`'),
             $covLine,
             '',
             '> **注意：界面直接调用系统字体的微软雅黑或宋体，系统需至少存在其中一个才能显示中文**',
