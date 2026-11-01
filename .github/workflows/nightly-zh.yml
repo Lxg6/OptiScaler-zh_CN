@@ -1,0 +1,405 @@
+name: OptiScaler Nightly 汉化
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游 optiscaler/OptiScaler 的分支或 commit（默认 master）'
+        required: false
+        default: 'master'
+      make_release:
+        description: '是否创建 GitHub Release（选 false 则只出构建产物 artifact）'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: nightly-zh
+  cancel-in-progress: true
+
+env:
+  BUILD_CONFIGURATION: Release
+  MAIN_REPO: optiscaler/OptiScaler
+  DLSSG_REPO: optiscaler/dlssg-to-fsr3
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'master' }}
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+  PYTHONPATH: zh
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: 检查上游是否有更新
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.cmp.outputs.changed }}
+    steps:
+      - name: 比对上次构建，判断是否需要重新构建
+        id: cmp
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          upstream=$(git ls-remote "https://github.com/${{ env.MAIN_REPO }}.git" refs/heads/master | cut -f1)
+          rel=$(gh api "repos/${REPO}/releases?per_page=1" --jq '.[0] | .tag_name + "\n" + .body' 2>/dev/null || true)
+          prev_up=$(printf '%s' "$rel" | grep -oP 'OptiScaler@[0-9a-f]{12}' | head -1 | cut -d@ -f2)
+          tag=$(printf '%s' "$rel" | head -1)
+          prev_rc=$(git ls-remote "https://github.com/${REPO}.git" "refs/tags/${tag}" | cut -f1)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ -z "$prev_up" ] || [ -z "$prev_rc" ] \
+             || [ "$prev_up" != "${upstream:0:12}" ] || [ "$prev_rc" != "$GITHUB_SHA" ]; then
+            changed=true
+          else
+            changed=false
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "上游 ${upstream:0:12} / 上次构建 ${prev_up:-<无>} -> 本次是否构建: $changed"
+
+  build:
+    name: 构建并发布
+    needs: check
+    if: needs.check.outputs.changed != 'false'
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: "[01] 检出汉化配方仓库（dict 字典 + zhkit 工具）"
+        uses: actions/checkout@v7
+        with:
+          path: zh
+
+      - name: "[02] 固定 Python 版本（工具链只用标准库，锁版本避免 runner 镜像升级带来漂移）"
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: "[03] 工具链自测（约 5 秒，防止带坏脚本去改源码）"
+        id: toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (python -m zhkit --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw '工具链无法启动' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "工具链：$version"
+          python -m zhkit selftest
+          if ($LASTEXITCODE -ne 0) { throw '工具链自测未通过' }
+
+      - name: "[04] 检出上游源码（含全部子模块，取 XeSS / FidelityFX 预编译 DLL）"
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.MAIN_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: "[05] 读版本号，生成包名 / tag / 上游 SHA"
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resourceFile = '.\src\OptiScaler\resource.h'
+          if (-not (Test-Path $resourceFile)) { throw "resource.h 不存在：$resourceFile" }
+
+          function Get-Ver([string]$pattern) {
+            $line = Get-Content $resourceFile | Select-String -Pattern ("^\s*#define\s+" + $pattern + "\s+") |
+                    Select-Object -First 1
+            if (-not $line) { throw "未匹配到 $pattern" }
+            return ($line.Line -replace ("^\s*#define\s+" + $pattern + "\s+"), '').Trim()
+          }
+
+          $major  = Get-Ver 'VER_MAJOR_VERSION'
+          $minor  = Get-Ver 'VER_MINOR_VERSION'
+          $hotfix = Get-Ver 'VER_HOTFIX_VERSION'
+          $build  = Get-Ver 'VER_BUILD_NUMBER'
+
+          $upstreamSha = (git -C .\src rev-parse HEAD | Select-Object -First 1).Trim()
+
+          $version  = "v$major.$minor.$hotfix-pre$build"
+          $date     = Get-Date -Format 'yyyyMMdd'
+          $filename = "OptiScaler_zh-CN_${version}_${date}"
+          $tag      = "nightly-zh-$date"
+
+          "version=$version"           >> $env:GITHUB_OUTPUT
+          "filename=$filename"         >> $env:GITHUB_OUTPUT
+          "release_tag=$tag"           >> $env:GITHUB_OUTPUT
+          "date=$date"                 >> $env:GITHUB_OUTPUT
+          "upstream_sha=$upstreamSha"  >> $env:GITHUB_OUTPUT
+          Write-Output "版本: $version / 包名: $filename.7z / tag: $tag / 上游: $upstreamSha"
+
+      - name: "[06] 注入汉化（字体 → 体检 → 写译文 → 复核）"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          Write-Output '--- 1/4 字体补丁（系统微软雅黑，缺失时回退宋体，中英文共用同一字体）---'
+          python -m zhkit font --src src
+          if ($LASTEXITCODE -ne 0) { throw '字体补丁注入失败' }
+
+          Write-Output '--- 2/4 体检（此时源码还是英文，统计才准）---'
+          python -m zhkit audit --src src --headers --out review | Tee-Object -FilePath coverage.txt
+          if ($LASTEXITCODE -ne 0) { Write-Output '待翻译清单生成失败，继续构建' }
+
+          $covLine = Get-Content 'coverage.txt' -Encoding utf8 |
+                     Where-Object { $_ -match '界面文本' } | Select-Object -First 1
+          if ($covLine) {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @(
+              '### 汉化覆盖率', '', '```', $covLine.Trim(), '```', '')
+            if ($covLine -match '未翻译 (\d+) 条') {
+              $pending = [int] $Matches[1]
+              if ($pending -gt 0) {
+                Write-Output "::warning title=待翻译 $pending 条::$pending 条界面文本还没有译文，详见 artifact「待翻译清单」"
+              }
+            }
+          }
+
+          Write-Output '--- 3/4 写入译文（cpp / ini / bat）---'
+          python -m zhkit apply --src src --headers --quiet
+          if ($LASTEXITCODE -ne 0) { throw '译文注入失败' }
+
+          Write-Output '--- 4/4 复核（字体补丁 + 译文是否真的落到 cpp / ini / bat）---'
+          python -m zhkit font --src src --check
+          if ($LASTEXITCODE -ne 0) { throw '字体补丁校验失败' }
+
+          python -m zhkit check --src src
+          if ($LASTEXITCODE -ne 0) { throw '汉化结果复核失败' }
+
+      - name: "[07] 上传待翻译清单（构建页下载「待翻译清单」）"
+        uses: actions/upload-artifact@v7
+        with:
+          name: 待翻译清单
+          path: review\
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: "[08] 配置 MSBuild"
+        uses: microsoft/setup-msbuild@v3
+
+      - name: "[09] 编译（Release，源文件按 UTF-8 解析）"
+        working-directory: src
+        env:
+          CL: /utf-8
+        run: msbuild /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} . /verbosity:minimal
+
+      - name: "[10] 补入 dlssg-to-fsr3 的 DLL（官方包有，源码里没有）"
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $downloadDir = Join-Path $env:GITHUB_WORKSPACE 'dlssg-download'
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          gh release download --repo $env:DLSSG_REPO --pattern '*.zip' --dir $downloadDir --clobber
+
+          $zips = @(Get-ChildItem -Path $downloadDir -Filter '*.zip' | Sort-Object Name)
+          if ($zips.Count -eq 0) {
+            throw "dlssg-to-fsr3 的 release 里没有 zip 资产：$downloadDir"
+          }
+          if ($zips.Count -gt 1) {
+            Write-Output "::warning title=dlssg zip 数量异常::期望 1 个 zip，实际 $($zips.Count) 个（$($zips.Name -join ', ')），已取 $($zips[0].Name)"
+          }
+          $zipFile = $zips[0]
+
+          $extractPath = Join-Path $env:GITHUB_WORKSPACE 'dlssg-extracted'
+          Expand-Archive -Path $zipFile.FullName -DestinationPath $extractPath -Force
+
+          $dllName = 'dlssg_to_fsr3_amd_is_better.dll'
+          $dll = Get-ChildItem -Path $extractPath -Filter $dllName -Recurse | Select-Object -First 1
+          if (-not $dll) { throw "$dllName 不在 $($zipFile.Name) 里" }
+
+          $destDir = Join-Path $env:GITHUB_WORKSPACE 'src\x64\Release\a\OptiScaler'
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+          Copy-Item $dll.FullName (Join-Path $destDir $dllName) -Force
+          Write-Output "已放入 $dllName"
+
+          Copy-Item 'src\Streamlined_fetcher_windows.bat' $destDir -Force
+          Write-Output '已放入 Streamlined_fetcher_windows.bat'
+
+      - name: "[11] 检查打包目录（缺必需文件即失败，清单外文件只提示）"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'src\x64\Release\a'
+          $rootAbs = (Resolve-Path $root).Path
+
+          $known = @(
+            'OptiScaler.dll',
+            'OptiScaler.ini',
+            'setup_windows.bat',
+            'setup_linux.sh',
+            '!! EXTRACT ALL FILES TO GAME FOLDER !!',
+            'OptiScaler\Streamlined_fetcher_windows.bat',
+            'OptiScaler\dlssg_to_fsr3_amd_is_better.dll',
+            'OptiScaler\libxess.dll',
+            'OptiScaler\libxess_dx11.dll',
+            'OptiScaler\libxess_fg.dll',
+            'OptiScaler\libxell.dll',
+            'OptiScaler\amd_fidelityfx_loader_dx12.dll',
+            'OptiScaler\amd_fidelityfx_upscaler_dx12.dll',
+            'OptiScaler\amd_fidelityfx_framegeneration_dx12.dll',
+            'OptiScaler\amd_fidelityfx_loader_vk.dll',
+            'OptiScaler\amd_fidelityfx_upscaler_vk.dll',
+            'OptiScaler\amd_fidelityfx_framegeneration_vk.dll',
+            'Licenses\XeSS_LICENSE.txt',
+            'Licenses\FidelityFX_v1_LICENSE.md',
+            'Licenses\FidelityFX_v2_LICENSE.md',
+            'Licenses\DirectX_LICENSE.txt'
+          )
+          $knownPatterns = 'OptiScaler\D3D12_OptiScaler\*', 'OptiScaler\Licenses\*', 'OptiScaler\custom\*'
+
+          $unknown = @(Get-ChildItem $root -Recurse -File | Where-Object {
+              $rel = $_.FullName.Substring($rootAbs.Length + 1)
+              ($known -notcontains $rel) -and -not (@($knownPatterns | Where-Object { $rel -like $_ }))
+          })
+          $required = 'OptiScaler.dll', 'OptiScaler.ini', 'setup_windows.bat'
+          $missing = @($required | Where-Object { -not (Test-Path (Join-Path $root $_)) })
+          if ($missing.Count -gt 0) { throw "构建产物缺少必需文件：$($missing -join ', ')" }
+
+          $expected = 'OptiScaler\libxess_fg.dll',
+                      'OptiScaler\amd_fidelityfx_loader_vk.dll',
+                      'OptiScaler\amd_fidelityfx_upscaler_vk.dll',
+                      'OptiScaler\amd_fidelityfx_framegeneration_vk.dll'
+          $absent = @($expected | Where-Object { -not (Test-Path (Join-Path $root $_)) })
+          if ($absent.Count -gt 0) {
+            Write-Output ("::warning title=缺少功能 dll::{0} 未生成，Vulkan FFX / XeSS 帧生成可能缺依赖" -f ($absent -join ', '))
+          }
+
+          if ($unknown.Count -gt 0) {
+            Write-Output "提示：包内有 $($unknown.Count) 个清单外文件（上游可能新增了打包内容，考虑是否纳入清单）："
+            $unknown | ForEach-Object { Write-Output "  + $($_.FullName.Substring($rootAbs.Length + 1))" }
+          }
+
+          Write-Output 'OptiScaler\ 内的 dll：'
+          Get-ChildItem (Join-Path $root 'OptiScaler') -File -Filter '*.dll' | Sort-Object Name |
+            ForEach-Object { Write-Output "  - $($_.Name) ($([Math]::Round($_.Length / 1KB)) KB)" }
+
+          Write-Output '打包结构检查完成'
+          Get-ChildItem -Path $root -Recurse -File | Measure-Object -Property Length -Sum |
+            ForEach-Object { Write-Output ("文件数 {0}，总大小 {1:N1} MB" -f $_.Count, ($_.Sum / 1MB)) }
+
+      - name: "[12] 压缩成 7z"
+        shell: pwsh
+        run: |
+          $zipName = "${{ steps.ver.outputs.filename }}.7z"
+          Push-Location 'src\x64\Release\a'
+          try {
+            7z a -r "$env:GITHUB_WORKSPACE\$zipName" "*.*"
+          } finally {
+            Pop-Location
+          }
+
+      - name: "[13] 上传构建产物（仅手动运行且不发布 Release 时）"
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.make_release != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.ver.outputs.filename }}
+          path: ${{ github.workspace }}\${{ steps.ver.outputs.filename }}.7z
+          compression-level: 0
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: "[14] 生成发布说明（覆盖率 + 上游 SHA）"
+        if: github.event_name == 'schedule' || github.event.inputs.make_release == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          UPSTREAM_SHA: ${{ steps.ver.outputs.upstream_sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.version }}
+        run: |
+          $coverage = ''
+          if (Test-Path 'coverage.txt') {
+            $line = Get-Content 'coverage.txt' -Encoding utf8 | Where-Object { $_ -match '界面文本' } | Select-Object -First 1
+            if ($line) { $coverage = ($line.Trim() -replace '^界面文本\s*[:：]\s*', '') }
+          }
+          $covLine = if ($coverage) { '- 界面文本：`' + $coverage + '`' } else { '- 界面文本：`未获取到`' }
+
+          if ($env:UPSTREAM_SHA) {
+            $shortSha = $env:UPSTREAM_SHA.Substring(0, [Math]::Min(12, $env:UPSTREAM_SHA.Length))
+          } else {
+            $shortSha = 'unknown'
+          }
+
+          $md = @(
+            ('- 上游源码：`optiscaler/OptiScaler@' + $shortSha + '`'),
+            ('- 版本：`' + $env:VERSION + '` / 构建日期：`' + (Get-Date -Format 'yyyy-MM-dd') + '`'),
+            ('- 汉化工具链：`' + $env:TOOLCHAIN + '`'),
+            $covLine,
+            '',
+            '> **注意：界面直接调用系统字体的微软雅黑或宋体，系统需至少存在其中一个才能显示中文**',
+            '',
+            '- 安装：解压后把全部文件放进游戏目录，运行 `setup_windows.bat`',
+            '- 卸载：运行安装脚本生成的 `卸载_OptiScaler.bat`；包结构与官方包一致，可与官方包互换',
+            '- 官方 OptiScaler-nightly 发布页：https://github.com/optiscaler/OptiScaler-nightly/releases',
+            '',
+            '**说明：个人汉化分支构建，<ins>未做代码签名</ins>，首次运行可能弹出 SmartScreen 提示（Windows 的「未知发布者」警告）**'
+          ) -join "`n"
+
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'release_notes.md'), $md,
+                                        [System.Text.UTF8Encoding]::new($false))
+          Write-Output '发布说明已生成'
+
+      - name: "[15] 发布 GitHub Release（预发布，不覆盖正式版）"
+        if: github.event_name == 'schedule' || github.event.inputs.make_release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.ver.outputs.release_tag }}
+          name: Nightly-zh_CN-${{ steps.ver.outputs.date }}
+          body_path: release_notes.md
+          files: ${{ github.workspace }}/${{ steps.ver.outputs.filename }}.7z
+          prerelease: true
+          draft: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "[16] 清理旧版本（合计上限 11，只删预发行）"
+        if: github.event_name == 'schedule' || github.event.inputs.make_release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $keep = 11
+          $rels = gh release list --repo $env:GITHUB_REPOSITORY --limit 300 --json tagName,createdAt,isPrerelease,isDraft |
+              ConvertFrom-Json
+          $rels = @($rels | Where-Object { $_.tagName -like 'nightly-zh-*' -and -not $_.isDraft } |
+              Sort-Object { [datetimeoffset] $_.createdAt } -Descending)
+          $promoted = @($rels | Where-Object { -not $_.isPrerelease })
+          $keepPre = $keep - $promoted.Count
+          Write-Output "nightly-zh 共 $($rels.Count) 个：预发行 $($rels.Count - $promoted.Count) / 转正 $($promoted.Count)"
+          if ($promoted.Count -gt 0) { Write-Output "保留转正版：$($promoted.tagName -join ', ')" }
+          if ($keepPre -le 0) {
+            Write-Output "::warning title=转正版已占满 $keep 个名额::预发行暂不保留，请手动删掉多余的转正版"
+            exit 0
+          }
+          $pre = @($rels | Where-Object { $_.isPrerelease })
+          $extra = @($pre | Select-Object -Skip $keepPre)
+          if ($extra.Count -eq 0) { Write-Output "预发行 $($pre.Count) 个，未超过 $keepPre 个名额，无需清理"; exit 0 }
+          foreach ($r in $extra) {
+            gh release delete $r.tagName --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes
+            Write-Output "已删除 $($r.tagName)（预发行）"
+          }
+          Write-Output "清理完成：删除 $($extra.Count) 个，剩余 $($rels.Count - $extra.Count) 个"
+
+      - name: "[17] 失败时留存补丁后的源码（便于本地复现）"
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: patched-src-${{ steps.ver.outputs.date }}
+          path: |
+            src/OptiScaler/menu/*.cpp
+            src/OptiScaler/menu/font/UI_Font.h
+            src/OptiScaler/dllmain.cpp
+            src/OptiScaler/OptiScaler.vcxproj
+            src/OptiScaler/OptiScaler.vcxproj.filters
+            src/OptiScaler.ini
+            src/setup_windows.bat
+            coverage.txt
+          if-no-files-found: ignore
+          retention-days: 7
