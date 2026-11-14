@@ -342,7 +342,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.release_tag }}
-          name: Nightly-zh_CN-${{ steps.ver.outputs.date }}
+          name: OptiScaler-zh_CN-${{ steps.ver.outputs.date }}
           body_path: release_notes.md
           files: ${{ github.workspace }}/${{ steps.ver.outputs.filename }}.7z
           prerelease: true
