@@ -1,6 +1,0 @@
-review/
-src/
-coverage.txt
-__pycache__/
-*.py[cod]
-.venv/
